@@ -1,16 +1,29 @@
 CC     = gcc
 CFLAGS = -Wall -Wextra -std=c11
 
+RAYLIB_INC = /usr/local/include
+RAYLIB_LIB = /usr/local/lib
+RAYLIB_FLAGS = -I$(RAYLIB_INC) -L$(RAYLIB_LIB) -Wl,-rpath,$(RAYLIB_LIB) \
+               -lraylib -lm -lpthread -ldl -lrt -lX11
+
 SRCS_1 = main.c graph.c dijkstra.c
+SRCS_2 = main_sim.c graph.c dijkstra.c
 HDRS   = graph.h dijkstra.h
 
-.PHONY: milestone1 clean
+.PHONY: all milestone1 milestone2 clean
+all: milestone1 milestone2
 
 # ── Milestone 1 : Dijkstra CLI ───────────────────────────────────────────────
 milestone1: dijkstra
 
 dijkstra: $(SRCS_1) $(HDRS)
 	$(CC) $(CFLAGS) -o dijkstra $(SRCS_1)
+
+# ── Milestone 2 : raylib GUI ─────────────────────────────────────────────────
+milestone2: sim
+
+sim: $(SRCS_2) $(HDRS)
+	$(CC) $(CFLAGS) -o sim $(SRCS_2) $(RAYLIB_FLAGS)
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 clean:
