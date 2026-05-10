@@ -10,8 +10,7 @@ SRCS_1 = main.c graph.c dijkstra.c
 SRCS_2 = main_sim.c graph.c dijkstra.c
 HDRS   = graph.h dijkstra.h
 
-.PHONY: all milestone1 milestone2 clean
-all: milestone1 milestone2
+.PHONY: milestone1 milestone2 milestone3 clean
 
 # ── Milestone 1 : Dijkstra CLI ───────────────────────────────────────────────
 milestone1: dijkstra
@@ -21,6 +20,9 @@ dijkstra: $(SRCS_1) $(HDRS)
 
 # ── Milestone 2 : raylib GUI ─────────────────────────────────────────────────
 milestone2: sim
+
+# ── Milestone 3 : animation ──────────────────────────────────────────────────
+milestone3: sim
 
 sim: $(SRCS_2) $(HDRS)
 	$(CC) $(CFLAGS) -o sim $(SRCS_2) $(RAYLIB_FLAGS)

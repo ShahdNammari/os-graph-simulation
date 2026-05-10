@@ -6,10 +6,27 @@
 #include "graph.h"
 #include "dijkstra.h"
 
-#define SCREEN_W  900
-#define SCREEN_H  700
-#define NODE_R     25
-#define MAX_NODES  15
+#define SCREEN_W   900
+#define SCREEN_H   700
+#define NODE_R      25
+#define MAX_NODES   15
+#define JUMP_MS   300.0f   /* ms per jump on an edge          */
+#define WAIT_MS  1000.0f   /* ms waiting at intermediate node */
+
+/* ── animation state ────────────────────────────────────────────────────────*/
+
+typedef enum { ANIM_IDLE, ANIM_MOVING, ANIM_WAITING, ANIM_DONE } AnimState;
+
+typedef struct {
+    AnimState state;
+    int       playing;
+    int       path_idx;    /* entity moves from path[path_idx] to path[path_idx+1] */
+    int       jump;        /* discrete jump index within current edge (0..weight) */
+    float     timer_ms;    /* time accumulated in current phase */
+    Vector2   entity_pos;  /* current on-screen position of the entity */
+} Anim;
+
+/* ── drawing helpers ─────────────────────────────────────────────────────────*/
 
 static void compute_positions(int n, Vector2 *pos) {
     float cx = SCREEN_W / 2.0f, cy = SCREEN_H / 2.0f;
@@ -35,6 +52,76 @@ static void draw_arrow(Vector2 from, Vector2 to, Color color, float thickness) {
     DrawTriangle(e, p1, p2, color);
 }
 
+/* ── animation helpers ───────────────────────────────────────────────────────*/
+
+static int edge_weight(Graph *g, int src, int dst) {
+    for (EdgeNode *e = g->adj[src]; e; e = e->next)
+        if (e->dst == dst) return (e->weight > 0) ? e->weight : 1;
+    return 1;
+}
+
+static void anim_reset(Anim *a, Vector2 *pos, DijkstraResult *result) {
+    a->state      = ANIM_IDLE;
+    a->playing    = 0;
+    a->path_idx   = 0;
+    a->jump       = 0;
+    a->timer_ms   = 0.0f;
+    a->entity_pos = (result && result->found && result->path_len > 0)
+                    ? pos[result->path[0]] : (Vector2){0, 0};
+}
+
+static void anim_update(Anim *a, DijkstraResult *result, Graph *g,
+                        Vector2 *pos, float dt_ms) {
+    if (!a->playing || !result || !result->found) return;
+
+    /* kick off */
+    if (a->state == ANIM_IDLE) {
+        if (result->path_len <= 1) { a->state = ANIM_DONE; a->playing = 0; return; }
+        a->state = ANIM_MOVING;
+    }
+
+    if (a->state == ANIM_MOVING) {
+        int from = result->path[a->path_idx];
+        int to   = result->path[a->path_idx + 1];
+        int w    = edge_weight(g, from, to);
+
+        /* place entity at current discrete jump position */
+        float t = (float)a->jump / (float)w;
+        a->entity_pos.x = pos[from].x + t * (pos[to].x - pos[from].x);
+        a->entity_pos.y = pos[from].y + t * (pos[to].y - pos[from].y);
+
+        a->timer_ms += dt_ms;
+        if (a->timer_ms >= JUMP_MS) {
+            a->timer_ms -= JUMP_MS;
+            a->jump++;
+            if (a->jump >= w) {
+                /* arrived at next node */
+                a->entity_pos = pos[to];
+                a->path_idx++;
+                a->jump     = 0;
+                a->timer_ms = 0.0f;
+                if (a->path_idx + 1 >= result->path_len) {
+                    a->state   = ANIM_DONE;
+                    a->playing = 0;
+                } else {
+                    a->state = ANIM_WAITING; /* wait 1 s at intermediate node */
+                }
+            }
+        }
+        return;
+    }
+
+    if (a->state == ANIM_WAITING) {
+        a->timer_ms += dt_ms;
+        if (a->timer_ms >= WAIT_MS) {
+            a->timer_ms = 0.0f;
+            a->state    = ANIM_MOVING;
+        }
+    }
+}
+
+/* ── file I/O ────────────────────────────────────────────────────────────────*/
+
 static Graph *read_graph(const char *filename, int *q_src, int *q_dst) {
     FILE *fp = fopen(filename, "r");
     if (!fp) { fprintf(stderr, "Error: cannot open '%s'\n", filename); return NULL; }
@@ -58,6 +145,8 @@ static Graph *read_graph(const char *filename, int *q_src, int *q_dst) {
     return g;
 }
 
+/* ── main ────────────────────────────────────────────────────────────────────*/
+
 int main(int argc, char *argv[]) {
     if (argc != 2) { fprintf(stderr, "Usage: %s <input_file>\n", argv[0]); return 1; }
 
@@ -73,10 +162,33 @@ int main(int argc, char *argv[]) {
     Vector2 pos[MAX_NODES] = {0};
     compute_positions(n, pos);
 
+    Anim anim = {0};
+    anim_reset(&anim, pos, result);
+
+    Rectangle btn = { SCREEN_W - 130.0f, 10.0f, 110.0f, 40.0f };
+
     InitWindow(SCREEN_W, SCREEN_H, "Graph Simulation");
     SetTargetFPS(60);
 
     while (!WindowShouldClose()) {
+        float dt_ms = GetFrameTime() * 1000.0f;
+
+        /* ── input ── */
+        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) &&
+            CheckCollisionPointRec(GetMousePosition(), btn) &&
+            result && result->found) {
+            if (anim.state == ANIM_DONE) {
+                anim_reset(&anim, pos, result);
+                anim.playing = 1;
+                anim.state   = ANIM_IDLE;
+            } else {
+                anim.playing = !anim.playing;
+            }
+        }
+
+        anim_update(&anim, result, g, pos, dt_ms);
+
+        /* ── draw ── */
         BeginDrawing();
         ClearBackground((Color){25, 25, 35, 255});
 
@@ -88,9 +200,12 @@ int main(int argc, char *argv[]) {
                     for (int k = 0; k + 1 < result->path_len; k++)
                         if (result->path[k] == i && result->path[k + 1] == e->dst)
                             { on_path = 1; break; }
+
                 draw_arrow(pos[i], pos[e->dst],
                            on_path ? YELLOW : (Color){160, 160, 160, 255},
                            on_path ? 3.0f   : 1.5f);
+
+                /* weight label, offset perpendicular to edge */
                 float mx = (pos[i].x + pos[e->dst].x) * 0.5f;
                 float my = (pos[i].y + pos[e->dst].y) * 0.5f;
                 float ex = pos[e->dst].x - pos[i].x;
@@ -116,6 +231,36 @@ int main(int argc, char *argv[]) {
             char lbl[8]; snprintf(lbl, sizeof(lbl), "%d", i);
             int tw = MeasureText(lbl, 20);
             DrawText(lbl, (int)pos[i].x - tw / 2, (int)pos[i].y - 10, 20, WHITE);
+        }
+
+        /* entity — always visible while path exists */
+        if (result && result->found) {
+            DrawCircleV(anim.entity_pos, 14.0f, ORANGE);
+            DrawCircleLinesV(anim.entity_pos, 14.0f, WHITE);
+        }
+
+        /* play / stop / replay button */
+        if (result && result->found) {
+            const char *lbl = anim.playing              ? "STOP"
+                            : (anim.state == ANIM_DONE)  ? "REPLAY"
+                                                         : "PLAY";
+            Color bc = anim.playing ? RED : (Color){0, 160, 0, 255};
+            DrawRectangleRec(btn, bc);
+            DrawRectangleLinesEx(btn, 2.0f, WHITE);
+            int lw = MeasureText(lbl, 20);
+            DrawText(lbl,
+                     (int)(btn.x + (btn.width  - lw) / 2),
+                     (int)(btn.y + (btn.height - 20) / 2),
+                     20, WHITE);
+        }
+
+        /* arrived message */
+        if (anim.state == ANIM_DONE) {
+            const char *msg = "Arrived at destination!";
+            int mw = MeasureText(msg, 28);
+            DrawRectangle(SCREEN_W / 2 - mw / 2 - 20, SCREEN_H / 2 - 35,
+                          mw + 40, 70, (Color){0, 0, 0, 210});
+            DrawText(msg, SCREEN_W / 2 - mw / 2, SCREEN_H / 2 - 14, 28, GREEN);
         }
 
         /* status bar */
