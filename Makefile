@@ -10,7 +10,7 @@ SRCS_1 = main.c graph.c dijkstra.c
 SRCS_2 = main_sim.c graph.c dijkstra.c
 HDRS   = graph.h dijkstra.h
 
-.PHONY: milestone1 milestone2 milestone3 clean
+.PHONY: milestone1 milestone2 milestone3 milestone4 clean
 
 # ── Milestone 1 : Dijkstra CLI ───────────────────────────────────────────────
 milestone1: dijkstra
@@ -23,6 +23,9 @@ milestone2: sim
 
 # ── Milestone 3 : animation ──────────────────────────────────────────────────
 milestone3: sim
+
+# ── Milestone 4 : multiple processes (fork) ──────────────────────────────────
+milestone4: sim
 
 sim: $(SRCS_2) $(HDRS)
 	$(CC) $(CFLAGS) -o sim $(SRCS_2) $(RAYLIB_FLAGS)

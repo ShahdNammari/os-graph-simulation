@@ -20,6 +20,12 @@ make milestone3
 ./sim input.txt
 ```
 
+### Milestone 4 – Multiple processes (fork)
+```bash
+make milestone4
+./sim input.txt
+```
+
 ### Clean
 ```bash
 make clean
@@ -35,7 +41,7 @@ src dst w    # directed edge (repeated M times)
 src dst      # query: find shortest path from src to dst
 ```
 
-Example (`input.txt`):
+Example (`input.txt`) — milestone 4+ format:
 ```
 6 8
 0 1 4
@@ -46,7 +52,11 @@ Example (`input.txt`):
 3 4 2
 4 5 3
 2 5 10
+# travelers
+3
 0 5
+1 4
+2 3
 ```
 
 ---
@@ -71,3 +81,13 @@ An orange entity starts at the source and moves along the shortest path.
 - The entity waits 1 second at every intermediate node.
 - A PLAY / STOP / REPLAY button controls the animation.
 - An "Arrived at destination!" message is shown on arrival.
+
+### Milestone 4
+Multiple travelers moving simultaneously using `fork()`.
+Input file extended with a `# travelers` section listing N source/destination pairs.
+- Parent reads file, computes Dijkstra for every traveler, then `fork()`s N child processes.
+- Each child prints `[PID] started` and sleeps until killed.
+- Parent runs the raylib GUI showing all travelers in different colors moving in parallel.
+- When a traveler's animation finishes, parent sends `SIGTERM` to that child.
+- Parent `waitpid()`s all children before exiting.
+- IPC choice: signals (`SIGTERM`) for termination; path data stays in parent memory (no IPC needed in this stage — children only sleep).
