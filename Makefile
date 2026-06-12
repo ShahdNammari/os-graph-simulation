@@ -10,7 +10,7 @@ SRCS_1 = main.c graph.c dijkstra.c
 SRCS_2 = main_sim.c graph.c dijkstra.c
 HDRS   = graph.h dijkstra.h
 
-.PHONY: milestone1 milestone2 milestone3 milestone4 milestone5 clean
+.PHONY: milestone1 milestone2 milestone3 milestone4 milestone5 milestone6 clean
 
 # ── Milestone 1 : Dijkstra CLI ───────────────────────────────────────────────
 milestone1: dijkstra
@@ -29,6 +29,9 @@ milestone4: sim
 
 # ── Milestone 5 : IPC via pipes ──────────────────────────────────────────────
 milestone5: sim
+
+# ── Milestone 6 : node synchronization (semaphores) ─────────────────────────
+milestone6: sim
 
 sim: $(SRCS_2) $(HDRS)
 	$(CC) $(CFLAGS) -o sim $(SRCS_2) $(RAYLIB_FLAGS)
