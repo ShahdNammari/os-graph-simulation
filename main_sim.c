@@ -30,7 +30,7 @@ typedef struct {
 
 typedef struct {
     int            src, dst;
-    DijkstraResult *result;    /* parent-computed for edge highlighting only */
+    DijkstraResult result;    / parent-computed for edge highlighting only */
     pid_t          pid;
     int            pipe_fd;    /* parent read end; -1 = none */
     Color          color;
@@ -191,7 +191,7 @@ static void child_run(int write_fd, int src, int dst, const char *filename) {
 
         if (next_n != -1) {
             int w = edge_weight(g, node, next_n);
-            usleep((useconds_t)(w * JUMP_MS * 1000.0f));
+            usleep((useconds_t)((WAIT_MS + w * JUMP_MS) * 1000.0f));
         }
     }
 
@@ -258,13 +258,6 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < num_travelers; i++)
         travelers[i].color = PALETTE[i % MAX_TRAVELERS];
 
-    /* parent computes paths for GUI edge highlighting only */
-    for (int i = 0; i < num_travelers; i++) {
-        if (travelers[i].src >= 0 && travelers[i].src < n &&
-            travelers[i].dst >= 0 && travelers[i].dst < n)
-            travelers[i].result = dijkstra(g, travelers[i].src, travelers[i].dst);
-    }
-
     Vector2 pos[MAX_NODES] = {0};
     compute_positions(n, pos);
 
@@ -293,9 +286,14 @@ int main(int argc, char *argv[]) {
             CheckCollisionPointRec(GetMousePosition(), btn)) {
 
             if (!simulation_started) {
-                /* PLAY */
-                simulation_started = 1;
+                /* PLAY — fork first, then compute parent paths (children won't inherit) */
                 launch_travelers(travelers, num_travelers, pipes, argv[1], pos);
+                simulation_started = 1;
+                for (int i = 0; i < num_travelers; i++) {
+                    if (travelers[i].src >= 0 && travelers[i].src < n &&
+                        travelers[i].dst >= 0 && travelers[i].dst < n)
+                        travelers[i].result = dijkstra(g, travelers[i].src, travelers[i].dst);
+                }
 
             } else if (all_done) {
                 /* REPLAY — clean up old children then re-fork */
@@ -339,7 +337,7 @@ int main(int argc, char *argv[]) {
                         travelers[i].nxt_node    = msg.next;
                         travelers[i].anim_t      = 0.0f;
                         int w = edge_weight(g, msg.node, msg.next);
-                        travelers[i].anim_dur    = w * JUMP_MS;
+                        travelers[i].anim_dur    = WAIT_MS + w * JUMP_MS;
                         travelers[i].entity_pos  = pos[msg.node];
                         travelers[i].initialized = 1;
                     }
