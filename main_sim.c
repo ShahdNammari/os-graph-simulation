@@ -30,7 +30,7 @@ typedef struct {
 
 typedef struct {
     int            src, dst;
-    DijkstraResult result;    / parent-computed for edge highlighting only */
+    DijkstraResult *result;    /* parent-computed for edge highlighting only */
     pid_t          pid;
     int            pipe_fd;    /* parent read end; -1 = none */
     Color          color;
