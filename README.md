@@ -26,6 +26,12 @@ make milestone4
 ./sim input.txt
 ```
 
+### Milestone 5 – IPC via pipes
+```bash
+make milestone5
+./sim input.txt
+```
+
 ### Clean
 ```bash
 make clean
@@ -90,4 +96,16 @@ Input file extended with a `# travelers` section listing N source/destination pa
 - Parent runs the raylib GUI showing all travelers in different colors moving in parallel.
 - When a traveler's animation finishes, parent sends `SIGTERM` to that child.
 - Parent `waitpid()`s all children before exiting.
-- IPC choice: signals (`SIGTERM`) for termination; path data stays in parent memory (no IPC needed in this stage — children only sleep).
+
+### Milestone 5
+IPC via **pipes** — children are now autonomous: each child independently reads the graph, computes its own Dijkstra path, and reports its position to the parent.
+- **IPC mechanism chosen: anonymous pipes** (`pipe()`). One pipe per child (write end in child, read end in parent). Chosen because: simple API, kernel-buffered, naturally serializes messages, and works well with non-blocking reads in the GUI loop.
+- Parent forks children **before** computing any path data, so no path information exists in parent memory at fork time — clean separation.
+- Each child sends a `NodeMsg {pid, node, next}` when it arrives at each node, then sleeps `(1000 + weight×300) ms` before moving on.
+- Parent reads pipes non-blocking each frame, updates GUI positions, and prints the log:
+  ```
+  [PID=1021] arrived at node 0 | next node: 2
+  [PID=1021] arrived at node 2 | DESTINATION
+  [PID=1021] finished
+  ```
+- After closing the window the parent kills any remaining children and `waitpid()`s all.

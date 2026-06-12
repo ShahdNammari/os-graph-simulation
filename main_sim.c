@@ -8,6 +8,8 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <errno.h>
 #include "graph.h"
 #include "dijkstra.h"
 
@@ -19,24 +21,27 @@
 #define JUMP_MS      300.0f
 #define WAIT_MS     1000.0f
 
-typedef enum { ANIM_IDLE, ANIM_MOVING, ANIM_WAITING, ANIM_DONE } AnimState;
-
+/* message sent child → parent via pipe */
 typedef struct {
-    AnimState state;
-    int       playing;
-    int       path_idx;
-    int       jump;
-    float     timer_ms;
-    Vector2   entity_pos;
-} Anim;
+    int pid;
+    int node;
+    int next; /* -1 = destination reached */
+} NodeMsg;
 
 typedef struct {
     int            src, dst;
-    DijkstraResult *result;
+    DijkstraResult result;    / parent-computed for edge highlighting only */
     pid_t          pid;
-    int            signaled;
-    Anim           anim;
+    int            pipe_fd;    /* parent read end; -1 = none */
     Color          color;
+    /* message-driven animation */
+    int            cur_node;
+    int            nxt_node;   /* -1 = not moving */
+    float          anim_t;
+    float          anim_dur;
+    Vector2        entity_pos;
+    int            initialized;
+    int            done;
 } Traveler;
 
 static Color PALETTE[MAX_TRAVELERS] = {
@@ -52,7 +57,7 @@ static Color PALETTE[MAX_TRAVELERS] = {
     {200, 200,   0, 255},
 };
 
-/* drawing helpers */
+/* ── drawing helpers ─────────────────────────────────────────────────────────*/
 
 static void compute_positions(int n, Vector2 *pos) {
     float cx = SCREEN_W / 2.0f, cy = SCREEN_H / 2.0f;
@@ -78,72 +83,13 @@ static void draw_arrow(Vector2 from, Vector2 to, Color color, float thickness) {
     DrawTriangle(e, p1, p2, color);
 }
 
-/* animation helpers */
-
 static int edge_weight(Graph *g, int src, int dst) {
     for (EdgeNode *e = g->adj[src]; e; e = e->next)
         if (e->dst == dst) return (e->weight > 0) ? e->weight : 1;
     return 1;
 }
 
-static void anim_reset(Anim *a, Vector2 *pos, DijkstraResult *result) {
-    a->state      = ANIM_IDLE;
-    a->playing    = 0;
-    a->path_idx   = 0;
-    a->jump       = 0;
-    a->timer_ms   = 0.0f;
-    a->entity_pos = (result && result->found && result->path_len > 0)
-                    ? pos[result->path[0]] : (Vector2){0, 0};
-}
-
-static void anim_update(Anim *a, DijkstraResult *result, Graph *g,
-                        Vector2 *pos, float dt_ms) {
-    if (!a->playing || !result || !result->found) return;
-
-    if (a->state == ANIM_IDLE) {
-        if (result->path_len <= 1) { a->state = ANIM_DONE; a->playing = 0; return; }
-        a->state = ANIM_MOVING;
-    }
-
-    if (a->state == ANIM_MOVING) {
-        int from = result->path[a->path_idx];
-        int to   = result->path[a->path_idx + 1];
-        int w    = edge_weight(g, from, to);
-
-        float t = (float)a->jump / (float)w;
-        a->entity_pos.x = pos[from].x + t * (pos[to].x - pos[from].x);
-        a->entity_pos.y = pos[from].y + t * (pos[to].y - pos[from].y);
-
-        a->timer_ms += dt_ms;
-        if (a->timer_ms >= JUMP_MS) {
-            a->timer_ms -= JUMP_MS;
-            a->jump++;
-            if (a->jump >= w) {
-                a->entity_pos = pos[to];
-                a->path_idx++;
-                a->jump     = 0;
-                a->timer_ms = 0.0f;
-                if (a->path_idx + 1 >= result->path_len) {
-                    a->state   = ANIM_DONE;
-                    a->playing = 0;
-                } else {
-                    a->state = ANIM_WAITING;
-                }
-            }
-        }
-        return;
-    }
-
-    if (a->state == ANIM_WAITING) {
-        a->timer_ms += dt_ms;
-        if (a->timer_ms >= WAIT_MS) {
-            a->timer_ms = 0.0f;
-            a->state    = ANIM_MOVING;
-        }
-    }
-}
-
-/* file I/O */
+/* ── file I/O ────────────────────────────────────────────────────────────────*/
 
 static void skip_to_token(FILE *fp) {
     int c;
@@ -151,6 +97,26 @@ static void skip_to_token(FILE *fp) {
         if (c == '#') { while ((c = fgetc(fp)) != EOF && c != '\n'); }
         else if (!isspace((unsigned char)c)) { ungetc(c, fp); return; }
     }
+}
+
+static Graph *read_graph_only(const char *filename) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) return NULL;
+    skip_to_token(fp);
+    int n, m;
+    if (fscanf(fp, "%d %d", &n, &m) != 2 || n <= 0 || m < 0) {
+        fclose(fp); return NULL;
+    }
+    Graph *g = graph_create(n);
+    for (int i = 0; i < m; i++) {
+        int src, dst, w;
+        if (fscanf(fp, "%d %d %d", &src, &dst, &w) != 3) {
+            graph_free(g); fclose(fp); return NULL;
+        }
+        graph_add_edge(g, src, dst, w);
+    }
+    fclose(fp);
+    return g;
 }
 
 static Graph *read_graph(const char *filename, Traveler *travelers, int *num_travelers) {
@@ -188,16 +154,96 @@ static Graph *read_graph(const char *filename, Traveler *travelers, int *num_tra
             *num_travelers = i;
             break;
         }
-        travelers[i].result   = NULL;
-        travelers[i].pid      = -1;
-        travelers[i].signaled = 0;
+        travelers[i].result      = NULL;
+        travelers[i].pid         = -1;
+        travelers[i].pipe_fd     = -1;
+        travelers[i].cur_node    = -1;
+        travelers[i].nxt_node    = -1;
+        travelers[i].anim_t      = 0.0f;
+        travelers[i].anim_dur    = 1.0f;
+        travelers[i].initialized = 0;
+        travelers[i].done        = 0;
     }
 
     fclose(fp);
     return g;
 }
 
-/* main */
+/* ── child process ───────────────────────────────────────────────────────────*/
+
+static void child_run(int write_fd, int src, int dst, const char *filename) {
+    Graph *g = read_graph_only(filename);
+    if (!g) { close(write_fd); exit(1); }
+
+    DijkstraResult *res = dijkstra(g, src, dst);
+    if (!res || !res->found) {
+        graph_free(g);
+        close(write_fd);
+        exit(0);
+    }
+
+    for (int i = 0; i < res->path_len; i++) {
+        int node   = res->path[i];
+        int next_n = (i + 1 < res->path_len) ? res->path[i + 1] : -1;
+
+        NodeMsg msg = { (int)getpid(), node, next_n };
+        write(write_fd, &msg, sizeof(msg));
+
+        if (next_n != -1) {
+            int w = edge_weight(g, node, next_n);
+            usleep((useconds_t)((WAIT_MS + w * JUMP_MS) * 1000.0f));
+        }
+    }
+
+    dijkstra_result_free(res);
+    graph_free(g);
+    close(write_fd);
+    exit(0);
+}
+
+/* ── launch all travelers (fork + pipes + reset state) ───────────────────────*/
+
+static void launch_travelers(Traveler *travelers, int num_travelers,
+                              int pipes[][2], const char *filename,
+                              Vector2 *pos) {
+    for (int i = 0; i < num_travelers; i++) {
+        if (pipe(pipes[i]) != 0) { perror("pipe"); return; }
+        travelers[i].pipe_fd = pipes[i][0];
+    }
+
+    for (int i = 0; i < num_travelers; i++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            for (int j = 0; j < num_travelers; j++) {
+                close(pipes[j][0]);
+                if (j != i) close(pipes[j][1]);
+            }
+            child_run(pipes[i][1], travelers[i].src, travelers[i].dst, filename);
+        } else if (pid > 0) {
+            travelers[i].pid = pid;
+        } else {
+            perror("fork");
+        }
+    }
+
+    for (int i = 0; i < num_travelers; i++) {
+        close(pipes[i][1]);
+        int flags = fcntl(pipes[i][0], F_GETFL, 0);
+        fcntl(pipes[i][0], F_SETFL, flags | O_NONBLOCK);
+    }
+
+    /* reset animation state for all travelers */
+    for (int i = 0; i < num_travelers; i++) {
+        travelers[i].done        = 0;
+        travelers[i].initialized = 0;
+        travelers[i].cur_node    = -1;
+        travelers[i].nxt_node    = -1;
+        travelers[i].anim_t      = 0.0f;
+        travelers[i].entity_pos  = pos[travelers[i].src];
+    }
+}
+
+/* ── main ────────────────────────────────────────────────────────────────────*/
 
 int main(int argc, char *argv[]) {
     if (argc != 2) { fprintf(stderr, "Usage: %s <input_file>\n", argv[0]); return 1; }
@@ -207,43 +253,20 @@ int main(int argc, char *argv[]) {
 
     Graph *g = read_graph(argv[1], travelers, &num_travelers);
     if (!g) return 1;
-
     int n = g->num_nodes;
 
-    /* compute Dijkstra for every traveler (parent does all path work) */
-    for (int i = 0; i < num_travelers; i++) {
+    for (int i = 0; i < num_travelers; i++)
         travelers[i].color = PALETTE[i % MAX_TRAVELERS];
-        if (travelers[i].src >= 0 && travelers[i].src < n &&
-            travelers[i].dst >= 0 && travelers[i].dst < n)
-            travelers[i].result = dijkstra(g, travelers[i].src, travelers[i].dst);
-    }
 
-    /* fork ALL children before touching raylib or animations */
-    for (int i = 0; i < num_travelers; i++) {
-        if (!travelers[i].result || !travelers[i].result->found) continue;
-        pid_t pid = fork();
-        if (pid == 0) {
-            /* child: print and sleep until signaled */
-            printf("[%d] started\n", getpid());
-            fflush(stdout);
-            while (1) sleep(1);
-            exit(0);
-        } else if (pid > 0) {
-            travelers[i].pid = pid;
-        } else {
-            perror("fork");
-        }
-    }
-
-    /* compute positions */
     Vector2 pos[MAX_NODES] = {0};
     compute_positions(n, pos);
 
-    /* initialise ALL animations together, after all forks are done */
-    for (int i = 0; i < num_travelers; i++) {
-        anim_reset(&travelers[i].anim, pos, travelers[i].result);
+    for (int i = 0; i < num_travelers; i++)
+        if (travelers[i].src >= 0 && travelers[i].src < n)
+            travelers[i].entity_pos = pos[travelers[i].src];
 
-    }
+    int pipes[MAX_TRAVELERS][2];
+    int simulation_started = 0;
 
     Rectangle btn = { SCREEN_W - 130.0f, 10.0f, 110.0f, 40.0f };
 
@@ -253,52 +276,104 @@ int main(int argc, char *argv[]) {
     while (!WindowShouldClose()) {
         float dt_ms = GetFrameTime() * 1000.0f;
 
-        /* input */
+        /* check all done */
+        int all_done = 1;
+        for (int i = 0; i < num_travelers; i++)
+            if (!travelers[i].done) { all_done = 0; break; }
+
+        /* ── button input ── */
         if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) &&
             CheckCollisionPointRec(GetMousePosition(), btn)) {
-            int all_done = 1, any_playing = 0;
-            for (int i = 0; i < num_travelers; i++) {
-                if (travelers[i].anim.state != ANIM_DONE) all_done = 0;
-                if (travelers[i].anim.playing)            any_playing = 1;
-            }
-            if (all_done) {
-                /* REPLAY: reset all animations (children are already dead, that's OK) */
+
+            if (!simulation_started) {
+                /* PLAY — fork first, then compute parent paths (children won't inherit) */
+                launch_travelers(travelers, num_travelers, pipes, argv[1], pos);
+                simulation_started = 1;
                 for (int i = 0; i < num_travelers; i++) {
-                    anim_reset(&travelers[i].anim, pos, travelers[i].result);
-                    if (travelers[i].result && travelers[i].result->found) {
-                        travelers[i].anim.playing = 1;
-                        travelers[i].anim.state   = ANIM_IDLE;
-                    }
-                    travelers[i].signaled = 0;
+                    if (travelers[i].src >= 0 && travelers[i].src < n &&
+                        travelers[i].dst >= 0 && travelers[i].dst < n)
+                        travelers[i].result = dijkstra(g, travelers[i].src, travelers[i].dst);
                 }
-            } else {
-                /* PLAY / STOP toggle */
-                for (int i = 0; i < num_travelers; i++)
-                    if (travelers[i].anim.state != ANIM_DONE)
-                        travelers[i].anim.playing = !any_playing;
+
+            } else if (all_done) {
+                /* REPLAY — clean up old children then re-fork */
+                for (int i = 0; i < num_travelers; i++) {
+                    if (travelers[i].pid > 0) {
+                        waitpid(travelers[i].pid, NULL, 0);
+                        travelers[i].pid = -1;
+                    }
+                    if (travelers[i].pipe_fd >= 0) {
+                        close(travelers[i].pipe_fd);
+                        travelers[i].pipe_fd = -1;
+                    }
+                }
+                launch_travelers(travelers, num_travelers, pipes, argv[1], pos);
             }
         }
 
-        /* update + signal finished children */
-        for (int i = 0; i < num_travelers; i++) {
-            anim_update(&travelers[i].anim, travelers[i].result, g, pos, dt_ms);
-            if (travelers[i].anim.state == ANIM_DONE &&
-                !travelers[i].signaled && travelers[i].pid > 0) {
-                kill(travelers[i].pid, SIGTERM);
-                travelers[i].signaled = 1;
+        /* ── poll pipes ── */
+        if (simulation_started) {
+            for (int i = 0; i < num_travelers; i++) {
+                if (travelers[i].pipe_fd < 0 || travelers[i].done) continue;
+
+                NodeMsg msg;
+                ssize_t r = read(travelers[i].pipe_fd, &msg, sizeof(msg));
+
+                if (r == (ssize_t)sizeof(msg)) {
+                    if (msg.next == -1) {
+                        printf("[PID=%d] arrived at node %d | DESTINATION\n",
+                               msg.pid, msg.node);
+                        printf("[PID=%d] finished\n", msg.pid);
+                        fflush(stdout);
+                        travelers[i].entity_pos = pos[msg.node];
+                        travelers[i].done       = 1;
+                        close(travelers[i].pipe_fd);
+                        travelers[i].pipe_fd = -1;
+                    } else {
+                        printf("[PID=%d] arrived at node %d | next node: %d\n",
+                               msg.pid, msg.node, msg.next);
+                        fflush(stdout);
+                        travelers[i].cur_node    = msg.node;
+                        travelers[i].nxt_node    = msg.next;
+                        travelers[i].anim_t      = 0.0f;
+                        int w = edge_weight(g, msg.node, msg.next);
+                        travelers[i].anim_dur    = WAIT_MS + w * JUMP_MS;
+                        travelers[i].entity_pos  = pos[msg.node];
+                        travelers[i].initialized = 1;
+                    }
+                } else if (r == 0) {
+                    close(travelers[i].pipe_fd);
+                    travelers[i].pipe_fd = -1;
+                    travelers[i].done    = 1;
+                }
             }
         }
 
-        /* draw */
+        /* ── update animations ── */
+        if (simulation_started) {
+            for (int i = 0; i < num_travelers; i++) {
+                if (!travelers[i].initialized || travelers[i].done ||
+                    travelers[i].nxt_node < 0) continue;
+                travelers[i].anim_t += dt_ms / travelers[i].anim_dur;
+                if (travelers[i].anim_t > 1.0f) travelers[i].anim_t = 1.0f;
+                float t  = travelers[i].anim_t;
+                int   c  = travelers[i].cur_node;
+                int   nx = travelers[i].nxt_node;
+                travelers[i].entity_pos.x = pos[c].x + t * (pos[nx].x - pos[c].x);
+                travelers[i].entity_pos.y = pos[c].y + t * (pos[nx].y - pos[c].y);
+            }
+        }
+
+        /* ── draw ── */
         BeginDrawing();
         ClearBackground((Color){25, 25, 35, 255});
 
-        /* base edges (gray) */
+        /* base edges */
         for (int i = 0; i < n; i++)
             for (EdgeNode *e = g->adj[i]; e; e = e->next)
                 draw_arrow(pos[i], pos[e->dst], (Color){160, 160, 160, 255}, 1.5f);
 
-        /* path edges per traveler (colored overlay) */
+        /* path edges per traveler */
         for (int t = 0; t < num_travelers; t++) {
             DijkstraResult *res = travelers[t].result;
             if (!res || !res->found) continue;
@@ -307,7 +382,7 @@ int main(int argc, char *argv[]) {
                            travelers[t].color, 3.0f);
         }
 
-        /* weight labels on top */
+        /* weight labels */
         for (int i = 0; i < n; i++) {
             for (EdgeNode *e = g->adj[i]; e; e = e->next) {
                 float mx = (pos[i].x + pos[e->dst].x) * 0.5f;
@@ -325,7 +400,8 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < n; i++) {
             Color nc = (Color){40, 80, 160, 255};
             for (int t = 0; t < num_travelers; t++)
-                if (i == travelers[t].src || i == travelers[t].dst) { nc = GREEN; break; }
+                if (i == travelers[t].src || i == travelers[t].dst)
+                    { nc = GREEN; break; }
             DrawCircleV(pos[i], NODE_R, nc);
             DrawCircleLinesV(pos[i], NODE_R, WHITE);
             char lbl[8]; snprintf(lbl, sizeof(lbl), "%d", i);
@@ -335,38 +411,36 @@ int main(int argc, char *argv[]) {
 
         /* traveler entities */
         for (int t = 0; t < num_travelers; t++) {
-            if (!travelers[t].result || !travelers[t].result->found) continue;
-            DrawCircleV(travelers[t].anim.entity_pos, 14.0f, travelers[t].color);
-            DrawCircleLinesV(travelers[t].anim.entity_pos, 14.0f, WHITE);
+            DrawCircleV(travelers[t].entity_pos, 14.0f, travelers[t].color);
+            DrawCircleLinesV(travelers[t].entity_pos, 14.0f, WHITE);
         }
 
-        /* PLAY / STOP / REPLAY button */
+        /* PLAY / REPLAY button */
         {
-            int all_done = 1, any_playing = 0;
-            for (int i = 0; i < num_travelers; i++) {
-                if (travelers[i].anim.state != ANIM_DONE) all_done = 0;
-                if (travelers[i].anim.playing)            any_playing = 1;
-            }
-            const char *lbl = all_done ? "REPLAY" : (any_playing ? "STOP" : "PLAY");
-            Color bc = any_playing ? RED : (Color){0, 160, 0, 255};
-            DrawRectangleRec(btn, bc);
-            DrawRectangleLinesEx(btn, 2.0f, WHITE);
-            int lw = MeasureText(lbl, 20);
-            DrawText(lbl,
-                     (int)(btn.x + (btn.width  - lw) / 2),
-                     (int)(btn.y + (btn.height - 20) / 2),
-                     20, WHITE);
-
-            if (all_done) {
-                const char *msg = "All travelers arrived!";
-                int mw = MeasureText(msg, 28);
-                DrawRectangle(SCREEN_W / 2 - mw / 2 - 20, SCREEN_H / 2 - 35,
-                              mw + 40, 70, (Color){0, 0, 0, 210});
-                DrawText(msg, SCREEN_W / 2 - mw / 2, SCREEN_H / 2 - 14, 28, GREEN);
+            const char *lbl = !simulation_started ? "PLAY"
+                            : all_done            ? "REPLAY"
+                            : NULL;
+            if (lbl) {
+                DrawRectangleRec(btn, (Color){0, 160, 0, 255});
+                DrawRectangleLinesEx(btn, 2.0f, WHITE);
+                int lw = MeasureText(lbl, 20);
+                DrawText(lbl,
+                         (int)(btn.x + (btn.width  - lw) / 2),
+                         (int)(btn.y + (btn.height - 20) / 2),
+                         20, WHITE);
             }
         }
 
-        /* status bar — one line per traveler */
+        /* all-arrived banner */
+        if (simulation_started && all_done) {
+            const char *msg_str = "All travelers arrived!";
+            int mw = MeasureText(msg_str, 28);
+            DrawRectangle(SCREEN_W / 2 - mw / 2 - 20, SCREEN_H / 2 - 35,
+                          mw + 40, 70, (Color){0, 0, 0, 210});
+            DrawText(msg_str, SCREEN_W / 2 - mw / 2, SCREEN_H / 2 - 14, 28, GREEN);
+        }
+
+        /* status bar */
         {
             int bar_h = 20 * num_travelers + 4;
             DrawRectangle(0, SCREEN_H - bar_h, SCREEN_W, bar_h, (Color){0, 0, 0, 200});
@@ -395,11 +469,15 @@ int main(int argc, char *argv[]) {
 
     CloseWindow();
 
-    /* signal any remaining children and wait for all */
+    /* kill any remaining children and wait */
     for (int i = 0; i < num_travelers; i++) {
         if (travelers[i].pid > 0) {
-            if (!travelers[i].signaled) kill(travelers[i].pid, SIGTERM);
+            if (!travelers[i].done) kill(travelers[i].pid, SIGTERM);
             waitpid(travelers[i].pid, NULL, 0);
+            if (travelers[i].pipe_fd >= 0) {
+                close(travelers[i].pipe_fd);
+                travelers[i].pipe_fd = -1;
+            }
         }
     }
 
