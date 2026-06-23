@@ -25,6 +25,8 @@
 #define MSG_ARRIVED  0
 #define MSG_WAITING  1
 
+typedef enum { SCHED_FCFS, SCHED_SJF } SchedAlgo;
+
 /* message sent child → parent via pipe */
 typedef struct {
     int pid;
@@ -35,7 +37,7 @@ typedef struct {
 
 typedef struct {
     int            src, dst;
-    DijkstraResult *result;    /* parent-computed for path highlighting */
+    DijkstraResult *result;    /* parent-computed for path highlighting + SJF cost */
     pid_t          pid;
     int            pipe_fd;
     Color          color;
@@ -46,9 +48,16 @@ typedef struct {
     Vector2        entity_pos;
     int            initialized;
     int            done;
-    int            waiting;       /* 1 = blocked outside a node */
-    int            waiting_for;   /* node id being waited for */
+    int            waiting;       /* 1 = queued outside a node, not yet granted entry */
 } Traveler;
+
+/* per-node software queue managed entirely by the parent (the scheduler) */
+typedef struct {
+    int    occupied;
+    double free_at_ms;             /* sim clock value at which the occupant leaves */
+    int    queue[MAX_TRAVELERS];   /* traveler indices, in arrival order            */
+    int    queue_len;
+} NodeState;
 
 static Color PALETTE[MAX_TRAVELERS] = {
     {255, 140,   0, 255},
@@ -62,6 +71,8 @@ static Color PALETTE[MAX_TRAVELERS] = {
     {  0, 200, 150, 255},
     {200, 200,   0, 255},
 };
+
+static const char *algo_name(SchedAlgo a) { return (a == SCHED_FCFS) ? "FCFS" : "SJF"; }
 
 static void compute_positions(int n, Vector2 *pos) {
     float cx = SCREEN_W / 2.0f, cy = SCREEN_H / 2.0f;
@@ -91,6 +102,20 @@ static int edge_weight(Graph *g, int src, int dst) {
     for (EdgeNode *e = g->adj[src]; e; e = e->next)
         if (e->dst == dst) return (e->weight > 0) ? e->weight : 1;
     return 1;
+}
+
+/* SJF "job length": remaining cost from `node` to the traveler's destination,
+ * read off the path Dijkstra already computed for it. */
+static int remaining_cost(Graph *g, DijkstraResult *res, int node) {
+    if (!res || !res->found) return 0;
+    int idx = -1;
+    for (int k = 0; k < res->path_len; k++)
+        if (res->path[k] == node) { idx = k; break; }
+    if (idx < 0) return 0;
+    int cost = 0;
+    for (int k = idx; k + 1 < res->path_len; k++)
+        cost += edge_weight(g, res->path[k], res->path[k + 1]);
+    return cost;
 }
 
 static void skip_to_token(FILE *fp) {
@@ -166,7 +191,6 @@ static Graph *read_graph(const char *filename, Traveler *travelers, int *num_tra
         travelers[i].initialized = 0;
         travelers[i].done        = 0;
         travelers[i].waiting     = 0;
-        travelers[i].waiting_for = -1;
     }
 
     fclose(fp);
@@ -175,14 +199,16 @@ static Graph *read_graph(const char *filename, Traveler *travelers, int *num_tra
 
 /*
  * Child: reads graph independently, computes own Dijkstra path, then travels.
- * Intermediate nodes (not source, not destination) require exclusive semaphore access:
- *   1. Send MSG_WAITING  → parent shows traveler blocked outside node
- *   2. sem_wait()        → blocks until node is free (no starvation: POSIX sem is FIFO on Linux)
+ * Intermediate nodes (not source, not destination) require permission from the
+ * PARENT (the scheduler) before entering — the parent decides ordering (FCFS/SJF),
+ * not the OS:
+ *   1. Send MSG_WAITING  → parent enqueues this traveler for the node
+ *   2. sem_wait(own sem) → blocks until the parent's scheduler grants this traveler entry
  *   3. Send MSG_ARRIVED  → parent shows traveler inside node
- *   4. sleep 1 second    → critical section
- *   5. sem_post()        → release node for next traveler
+ *   4. sleep 1 second    → critical section (parent tracks release via its own clock)
  */
-static void child_run(int write_fd, int src, int dst, const char *filename, pid_t ppid) {
+static void child_run(int write_fd, int src, int dst, const char *filename,
+                       pid_t ppid, int my_idx) {
     Graph *g = read_graph_only(filename);
     if (!g) { close(write_fd); exit(1); }
 
@@ -199,15 +225,16 @@ static void child_run(int write_fd, int src, int dst, const char *filename, pid_
         int is_intermediate = (i > 0) && (next_n != -1);
 
         if (is_intermediate) {
-            /* step 1: signal parent — waiting outside this node */
+            /* step 1: tell the parent we want to enter this node */
             NodeMsg wait_msg = { (int)getpid(), MSG_WAITING, node, next_n };
             write(write_fd, &wait_msg, sizeof(wait_msg));
 
-            /* step 2: acquire exclusive access to this node */
+            /* step 2: block until the parent's scheduler grants permission */
             char sem_name[64];
-            snprintf(sem_name, sizeof(sem_name), "/grsim_%d_%d", (int)ppid, node);
+            snprintf(sem_name, sizeof(sem_name), "/grsim_%d_t%d", (int)ppid, my_idx);
             sem_t *sem = sem_open(sem_name, 0);
             sem_wait(sem);
+            sem_close(sem);
 
             /* step 3: inside the node — signal parent */
             NodeMsg arrive_msg = { (int)getpid(), MSG_ARRIVED, node, next_n };
@@ -216,15 +243,12 @@ static void child_run(int write_fd, int src, int dst, const char *filename, pid_
             /* step 4: critical section — wait 1 second at this node */
             usleep((useconds_t)(WAIT_MS * 1000.0f));
 
-            /* step 5: release the node */
-            sem_post(sem);
-            sem_close(sem);
-
-            /* travel to next node */
+            /* travel to next node (no release message needed: the parent
+             * tracks the fixed 1-second critical section with its own clock) */
             int w = edge_weight(g, node, next_n);
             usleep((useconds_t)(w * JUMP_MS * 1000.0f));
         } else {
-            /* source or destination: no semaphore needed */
+            /* source or destination: no queueing needed */
             NodeMsg msg = { (int)getpid(), MSG_ARRIVED, node, next_n };
             write(write_fd, &msg, sizeof(msg));
             if (next_n != -1) {
@@ -240,21 +264,22 @@ static void child_run(int write_fd, int src, int dst, const char *filename, pid_
     exit(0);
 }
 
-/* Create semaphores, pipes, fork children, reset traveler animation state. */
+/* Create per-traveler permission semaphores, pipes, fork children,
+ * reset traveler + node-queue state. */
 static void launch_travelers(Traveler *travelers, int num_travelers,
                               int pipes[][2], const char *filename,
-                              Vector2 *pos, int n, pid_t my_pid) {
-    /* create one binary semaphore per node (value 1 = free) */
-    for (int i = 0; i < n; i++) {
+                              Vector2 *pos, int n, pid_t my_pid,
+                              NodeState *node_state, double *sim_clock_ms) {
+    /* one "permission slip" semaphore per traveler, starts at 0 (locked) */
+    for (int i = 0; i < num_travelers; i++) {
         char name[64];
-        snprintf(name, sizeof(name), "/grsim_%d_%d", (int)my_pid, i);
+        snprintf(name, sizeof(name), "/grsim_%d_t%d", (int)my_pid, i);
         sem_unlink(name);
-        sem_t *s = sem_open(name, O_CREAT | O_EXCL, 0644, 1);
+        sem_t *s = sem_open(name, O_CREAT | O_EXCL, 0644, 0);
         if (s == SEM_FAILED) { perror("sem_open"); return; }
         sem_close(s);
     }
 
-    /* create one pipe per traveler */
     for (int i = 0; i < num_travelers; i++) {
         if (pipe(pipes[i]) != 0) { perror("pipe"); return; }
         travelers[i].pipe_fd = pipes[i][0];
@@ -268,7 +293,7 @@ static void launch_travelers(Traveler *travelers, int num_travelers,
                 close(pipes[j][0]);
                 if (j != i) close(pipes[j][1]);
             }
-            child_run(pipes[i][1], travelers[i].src, travelers[i].dst, filename, my_pid);
+            child_run(pipes[i][1], travelers[i].src, travelers[i].dst, filename, my_pid, i);
             /* never returns */
         } else if (pid > 0) {
             travelers[i].pid = pid;
@@ -277,14 +302,12 @@ static void launch_travelers(Traveler *travelers, int num_travelers,
         }
     }
 
-    /* close write ends, make read ends non-blocking */
     for (int i = 0; i < num_travelers; i++) {
         close(pipes[i][1]);
         int flags = fcntl(pipes[i][0], F_GETFL, 0);
         fcntl(pipes[i][0], F_SETFL, flags | O_NONBLOCK);
     }
 
-    /* reset traveler animation state */
     for (int i = 0; i < num_travelers; i++) {
         travelers[i].done        = 0;
         travelers[i].initialized = 0;
@@ -292,19 +315,59 @@ static void launch_travelers(Traveler *travelers, int num_travelers,
         travelers[i].nxt_node    = -1;
         travelers[i].anim_t      = 0.0f;
         travelers[i].waiting     = 0;
-        travelers[i].waiting_for = -1;
         if (travelers[i].src >= 0 && travelers[i].src < n)
             travelers[i].entity_pos = pos[travelers[i].src];
     }
+
+    for (int i = 0; i < n; i++) {
+        node_state[i].occupied   = 0;
+        node_state[i].free_at_ms = 0.0;
+        node_state[i].queue_len  = 0;
+    }
+    *sim_clock_ms = 0.0;
+}
+
+/* Remove the queue entry at `slot`, preserving relative arrival order. */
+static void node_queue_remove_at(NodeState *ns, int slot) {
+    for (int k = slot; k + 1 < ns->queue_len; k++)
+        ns->queue[k] = ns->queue[k + 1];
+    ns->queue_len--;
+}
+
+/* Pick the next traveler to admit into `node`, per the active scheduler.
+ * FCFS: earliest-arrived (front of queue). SJF: smallest remaining cost
+ * to destination, ties broken by arrival order. Returns traveler index or -1. */
+static int node_queue_pick(NodeState *ns, Traveler *travelers, Graph *g,
+                            int node, SchedAlgo algo) {
+    if (ns->queue_len == 0) return -1;
+    int best_slot = 0;
+    if (algo == SCHED_SJF) {
+        int best_cost = remaining_cost(g, travelers[ns->queue[0]].result, node);
+        for (int k = 1; k < ns->queue_len; k++) {
+            int c = remaining_cost(g, travelers[ns->queue[k]].result, node);
+            if (c < best_cost) { best_cost = c; best_slot = k; }
+        }
+    }
+    int idx = ns->queue[best_slot];
+    node_queue_remove_at(ns, best_slot);
+    return idx;
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 2) { fprintf(stderr, "Usage: %s <input_file>\n", argv[0]); return 1; }
+    if (argc != 4 || strcmp(argv[1], "-schd") != 0) {
+        fprintf(stderr, "Usage: %s -schd <fcfs|sjf> <input_file>\n", argv[0]);
+        return 1;
+    }
+    SchedAlgo algo;
+    if      (strcmp(argv[2], "fcfs") == 0) algo = SCHED_FCFS;
+    else if (strcmp(argv[2], "sjf")  == 0) algo = SCHED_SJF;
+    else { fprintf(stderr, "Error: unknown scheduler '%s' (use fcfs or sjf)\n", argv[2]); return 1; }
+    const char *filename = argv[3];
 
     Traveler travelers[MAX_TRAVELERS] = {0};
     int num_travelers = 0;
 
-    Graph *g = read_graph(argv[1], travelers, &num_travelers);
+    Graph *g = read_graph(filename, travelers, &num_travelers);
     if (!g) return 1;
     int n = g->num_nodes;
 
@@ -315,6 +378,9 @@ int main(int argc, char *argv[]) {
     int pipes[MAX_TRAVELERS][2];
     memset(pipes, -1, sizeof(pipes));
 
+    NodeState node_state[MAX_NODES] = {0};
+    double sim_clock_ms = 0.0;
+
     Vector2 pos[MAX_NODES] = {0};
     compute_positions(n, pos);
 
@@ -322,7 +388,9 @@ int main(int argc, char *argv[]) {
         if (travelers[i].src >= 0 && travelers[i].src < n)
             travelers[i].entity_pos = pos[travelers[i].src];
 
-    InitWindow(SCREEN_W, SCREEN_H, "Graph Simulation - Milestone 6");
+    char title[64];
+    snprintf(title, sizeof(title), "Graph Simulation - Milestone 7 [%s]", algo_name(algo));
+    InitWindow(SCREEN_W, SCREEN_H, title);
     SetTargetFPS(60);
 
     int simulation_started = 0;
@@ -331,7 +399,6 @@ int main(int argc, char *argv[]) {
     while (!WindowShouldClose()) {
         float dt_ms = GetFrameTime() * 1000.0f;
 
-        /* check if all travelers finished */
         int all_done = simulation_started;
         for (int i = 0; i < num_travelers; i++)
             if (!travelers[i].done) { all_done = 0; break; }
@@ -341,8 +408,8 @@ int main(int argc, char *argv[]) {
             Vector2 mp = GetMousePosition();
             if (CheckCollisionPointRec(mp, btn)) {
                 if (!simulation_started) {
-                    /* PLAY: fork children, then compute Dijkstra for GUI */
-                    launch_travelers(travelers, num_travelers, pipes, argv[1], pos, n, my_pid);
+                    launch_travelers(travelers, num_travelers, pipes, filename, pos,
+                                      n, my_pid, node_state, &sim_clock_ms);
                     simulation_started = 1;
                     for (int i = 0; i < num_travelers; i++) {
                         if (travelers[i].result) {
@@ -354,7 +421,6 @@ int main(int argc, char *argv[]) {
                             travelers[i].result = dijkstra(g, travelers[i].src, travelers[i].dst);
                     }
                 } else if (all_done) {
-                    /* REPLAY: kill/wait previous children, then re-launch */
                     for (int i = 0; i < num_travelers; i++) {
                         if (travelers[i].pid > 0) {
                             if (!travelers[i].done) kill(travelers[i].pid, SIGTERM);
@@ -366,13 +432,16 @@ int main(int argc, char *argv[]) {
                             travelers[i].pipe_fd = -1;
                         }
                     }
-                    launch_travelers(travelers, num_travelers, pipes, argv[1], pos, n, my_pid);
+                    launch_travelers(travelers, num_travelers, pipes, filename, pos,
+                                      n, my_pid, node_state, &sim_clock_ms);
                 }
             }
         }
 
-        /* poll pipes for messages from children */
         if (simulation_started) {
+            sim_clock_ms += dt_ms;
+
+            /* poll pipes for messages from children */
             for (int i = 0; i < num_travelers; i++) {
                 if (travelers[i].pipe_fd < 0 || travelers[i].done) continue;
 
@@ -383,9 +452,10 @@ int main(int argc, char *argv[]) {
                     if (msg.type == MSG_WAITING) {
                         printf("[PID=%d] waiting for node %d\n", msg.pid, msg.node);
                         fflush(stdout);
-                        travelers[i].waiting     = 1;
-                        travelers[i].waiting_for = msg.node;
-                        travelers[i].nxt_node    = -1; /* freeze animation */
+                        travelers[i].waiting  = 1;
+                        travelers[i].nxt_node = -1; /* freeze animation */
+                        NodeState *ns = &node_state[msg.node];
+                        ns->queue[ns->queue_len++] = i;
                     } else { /* MSG_ARRIVED */
                         travelers[i].waiting = 0;
                         if (msg.next == -1) {
@@ -416,6 +486,26 @@ int main(int argc, char *argv[]) {
                     travelers[i].done    = 1;
                 }
             }
+
+            /* scheduler: release finished occupants, then admit next in line */
+            for (int node = 0; node < n; node++) {
+                NodeState *ns = &node_state[node];
+                if (ns->occupied && sim_clock_ms >= ns->free_at_ms)
+                    ns->occupied = 0;
+
+                if (!ns->occupied) {
+                    int idx = node_queue_pick(ns, travelers, g, node, algo);
+                    if (idx >= 0) {
+                        ns->occupied   = 1;
+                        ns->free_at_ms = sim_clock_ms + WAIT_MS;
+                        travelers[idx].waiting = 0;
+                        char name[64];
+                        snprintf(name, sizeof(name), "/grsim_%d_t%d", (int)my_pid, idx);
+                        sem_t *sem = sem_open(name, 0);
+                        if (sem != SEM_FAILED) { sem_post(sem); sem_close(sem); }
+                    }
+                }
+            }
         }
 
         /* update animations — skip if waiting or not yet started */
@@ -435,12 +525,10 @@ int main(int argc, char *argv[]) {
         BeginDrawing();
         ClearBackground((Color){25, 25, 35, 255});
 
-        /* base edges (gray) */
         for (int i = 0; i < n; i++)
             for (EdgeNode *e = g->adj[i]; e; e = e->next)
                 draw_arrow(pos[i], pos[e->dst], (Color){160, 160, 160, 255}, 1.5f);
 
-        /* path overlays per traveler */
         for (int t = 0; t < num_travelers; t++) {
             DijkstraResult *res = travelers[t].result;
             if (!res || !res->found) continue;
@@ -449,7 +537,6 @@ int main(int argc, char *argv[]) {
                            travelers[t].color, 3.0f);
         }
 
-        /* weight labels */
         for (int i = 0; i < n; i++) {
             for (EdgeNode *e = g->adj[i]; e; e = e->next) {
                 float mx = (pos[i].x + pos[e->dst].x) * 0.5f;
@@ -463,7 +550,6 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* nodes */
         for (int i = 0; i < n; i++) {
             Color nc = (Color){40, 80, 160, 255};
             for (int t = 0; t < num_travelers; t++)
@@ -475,9 +561,6 @@ int main(int argc, char *argv[]) {
             DrawText(lbl, (int)pos[i].x - tw / 2, (int)pos[i].y - 10, 20, WHITE);
         }
 
-        /* traveler entities:
-         *   WAITING  → hollow double-ring with "W" label (blocked outside node)
-         *   MOVING   → filled circle with white outline */
         for (int t = 0; t < num_travelers; t++) {
             if (!simulation_started) continue;
             if (travelers[t].waiting) {
@@ -492,7 +575,6 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* all-arrived banner */
         if (all_done) {
             const char *msg_str = "All travelers arrived!";
             int mw = MeasureText(msg_str, 28);
@@ -501,7 +583,14 @@ int main(int argc, char *argv[]) {
             DrawText(msg_str, SCREEN_W / 2 - mw / 2, SCREEN_H / 2 - 14, 28, GREEN);
         }
 
-        /* PLAY / REPLAY button */
+        /* scheduler indicator — clearly visible, required by spec */
+        {
+            char sched_lbl[32];
+            snprintf(sched_lbl, sizeof(sched_lbl), "Scheduler: %s", algo_name(algo));
+            DrawRectangle(5, 5, MeasureText(sched_lbl, 22) + 14, 30, (Color){0, 0, 0, 180});
+            DrawText(sched_lbl, 12, 9, 22, YELLOW);
+        }
+
         {
             const char *lbl = !simulation_started ? "PLAY"
                             : all_done            ? "REPLAY"
@@ -515,7 +604,6 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* status bar */
         {
             int bar_h = 20 * num_travelers + 4;
             DrawRectangle(0, SCREEN_H - bar_h, SCREEN_W, bar_h, (Color){0, 0, 0, 200});
@@ -545,7 +633,6 @@ int main(int argc, char *argv[]) {
 
     CloseWindow();
 
-    /* kill any remaining children, then wait for all */
     for (int i = 0; i < num_travelers; i++) {
         if (travelers[i].pid > 0) {
             if (!travelers[i].done) kill(travelers[i].pid, SIGTERM);
@@ -557,10 +644,9 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* clean up named semaphores */
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < num_travelers; i++) {
         char name[64];
-        snprintf(name, sizeof(name), "/grsim_%d_%d", (int)my_pid, i);
+        snprintf(name, sizeof(name), "/grsim_%d_t%d", (int)my_pid, i);
         sem_unlink(name);
     }
 
