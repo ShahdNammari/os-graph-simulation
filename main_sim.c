@@ -21,12 +21,20 @@
 #define JUMP_MS      300.0f
 #define WAIT_MS     1000.0f
 
-/* message sent child → parent via pipe */
+/* message kinds sent child → parent via pipe */
+#define MSG_KIND_NODE    0
+#define MSG_KIND_SPECIAL 1
+
+/* unified pipe message:
+ *   MSG_KIND_NODE:    pid, node, extra = next node (-1 if destination)
+ *   MSG_KIND_SPECIAL: pid, node, extra = 1 if node can reach itself, else 0
+ */
 typedef struct {
+    int kind;
     int pid;
     int node;
-    int next; /* -1 = destination reached */
-} NodeMsg;
+    int extra;
+} PipeMsg;
 
 typedef struct {
     int            src, dst;
@@ -186,7 +194,15 @@ static void child_run(int write_fd, int src, int dst, const char *filename) {
         int node   = res->path[i];
         int next_n = (i + 1 < res->path_len) ? res->path[i + 1] : -1;
 
-        NodeMsg msg = { (int)getpid(), node, next_n };
+        /* special message sent first: can this node reach itself? */
+        int can_reach_self = 0;
+        for (EdgeNode *e = g->adj[node]; e; e = e->next)
+            if (e->dst == node) { can_reach_self = 1; break; }
+        PipeMsg special = { MSG_KIND_SPECIAL, (int)getpid(), node, can_reach_self };
+        write(write_fd, &special, sizeof(special));
+
+        /* regular traversal message sent after */
+        PipeMsg msg = { MSG_KIND_NODE, (int)getpid(), node, next_n };
         write(write_fd, &msg, sizeof(msg));
 
         if (next_n != -1) {
@@ -316,11 +332,16 @@ int main(int argc, char *argv[]) {
             for (int i = 0; i < num_travelers; i++) {
                 if (travelers[i].pipe_fd < 0 || travelers[i].done) continue;
 
-                NodeMsg msg;
+                PipeMsg msg;
                 ssize_t r = read(travelers[i].pipe_fd, &msg, sizeof(msg));
 
                 if (r == (ssize_t)sizeof(msg)) {
-                    if (msg.next == -1) {
+                    if (msg.kind == MSG_KIND_SPECIAL) {
+                        /* parent handles special message separately */
+                        printf("[SPECIAL][PID=%d] node %d can reach itself: %s\n",
+                               msg.pid, msg.node, msg.extra ? "YES" : "NO");
+                        fflush(stdout);
+                    } else if (msg.extra == -1) {   /* MSG_KIND_NODE, destination */
                         printf("[PID=%d] arrived at node %d | DESTINATION\n",
                                msg.pid, msg.node);
                         printf("[PID=%d] finished\n", msg.pid);
@@ -329,14 +350,14 @@ int main(int argc, char *argv[]) {
                         travelers[i].done       = 1;
                         close(travelers[i].pipe_fd);
                         travelers[i].pipe_fd = -1;
-                    } else {
+                    } else {                        /* MSG_KIND_NODE, in transit */
                         printf("[PID=%d] arrived at node %d | next node: %d\n",
-                               msg.pid, msg.node, msg.next);
+                               msg.pid, msg.node, msg.extra);
                         fflush(stdout);
                         travelers[i].cur_node    = msg.node;
-                        travelers[i].nxt_node    = msg.next;
+                        travelers[i].nxt_node    = msg.extra;
                         travelers[i].anim_t      = 0.0f;
-                        int w = edge_weight(g, msg.node, msg.next);
+                        int w = edge_weight(g, msg.node, msg.extra);
                         travelers[i].anim_dur    = WAIT_MS + w * JUMP_MS;
                         travelers[i].entity_pos  = pos[msg.node];
                         travelers[i].initialized = 1;
